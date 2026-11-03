@@ -630,8 +630,15 @@ def _load_profile(name: str) -> dict:
     path = ROOT / "client.local.toml"
     if not path.exists():
         raise SystemExit(f"Error: {path} not found (copy client.local.toml.example).")
-    with open(path, "rb") as f:
-        cfg = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(
+            f"Error: {path} is not valid TOML: {e}\n"
+            "Hint: Windows paths need forward slashes (\"C:/work/repo\") or "
+            "single quotes ('C:\\work\\repo'); backslashes in double quotes are escapes."
+        )
     profile = cfg.get("profiles", {}).get(name)
     if profile is None:
         raise SystemExit(f"Error: no [profiles.{name}] in {path}.")

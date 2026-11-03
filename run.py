@@ -82,10 +82,12 @@ def main():
     mcp_bridge._load_roles()
 
     # Start MCP servers in background threads
+    host = config.get("server", {}).get("host", "127.0.0.1")
     http_port = config.get("mcp", {}).get("http_port", 8200)
     sse_port = config.get("mcp", {}).get("sse_port", 8201)
     mcp_bridge.mcp_http.settings.port = http_port
     mcp_bridge.mcp_sse.settings.port = sse_port
+    mcp_bridge.configure_network(host)
 
     threading.Thread(target=mcp_bridge.run_http_server, daemon=True).start()
     threading.Thread(target=mcp_bridge.run_sse_server, daemon=True).start()
@@ -94,22 +96,55 @@ def main():
 
     # Mount static files
     from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import HTMLResponse
+    from fastapi import Form
+    from fastapi.requests import Request
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    import json as _json
+    import app as app_module
+    from tokens import is_local_request
 
     static_dir = ROOT / "static"
 
+    @app.post("/login")
+    async def login(token: str = Form("")):
+        # Humans on other machines sign in with their own token (tokens.py).
+        token = token.strip()
+        if not app_module.human_for_token(token):
+            return HTMLResponse(_login_page("Unknown or revoked token."), status_code=403)
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("agentchattr_token", token, httponly=True, samesite="strict",
+                        max_age=180 * 24 * 3600)
+        return resp
+
     @app.get("/")
-    async def index():
+    async def index(request: Request):
+        cookie_token = request.cookies.get("agentchattr_token", "")
+        human = app_module.human_for_token(cookie_token)
+        if human:
+            page_token, page_name = cookie_token, human
+        elif is_local_request(request.client.host if request.client else "",
+                              request.headers.get("host", "")):
+            # This machine, addressed by a loopback name: the legacy single-user
+            # session token. Same-origin policy keeps other pages from reading it,
+            # and the Host check keeps DNS-rebinding pages out.
+            page_token, page_name = session_token, ""
+        else:
+            return HTMLResponse(_login_page(), headers={"Cache-Control": "no-store"})
+
         # Read index.html fresh each request so changes take effect without restart.
-        # Inject the session token into the HTML so the browser client can use it.
-        # This is safe: same-origin policy prevents cross-origin pages from reading
-        # the response body, so only the user's own browser tab gets the token.
         html = (static_dir / "index.html").read_text("utf-8")
         injected = html.replace(
             "</head>",
-            f'<script>window.__SESSION_TOKEN__="{session_token}";</script>\n</head>',
+            f"<script>window.__SESSION_TOKEN__={_json.dumps(page_token)};"
+            f"window.__HUMAN_NAME__={_json.dumps(page_name)};</script>\n</head>",
         )
         return HTMLResponse(injected, headers={"Cache-Control": "no-store"})
+
+    @app.get("/logout")
+    async def logout():
+        resp = RedirectResponse("/", status_code=303)
+        resp.delete_cookie("agentchattr_token")
+        return resp
 
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -123,33 +158,24 @@ def main():
 
     # Run web server
     import uvicorn
-    host = config.get("server", {}).get("host", "127.0.0.1")
     port = config.get("server", {}).get("port", 8300)
 
     # --- Security: warn if binding to a non-localhost address ---
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"\n  !! SECURITY WARNING — binding to {host} !!")
-        print("  This exposes agentchattr to your local network.")
+        print("  This exposes agentchattr (web UI and MCP) to your local network.")
+        print("  Other machines need a per-client token: python tokens.py add <name> --kind human|claude|codex")
         print()
         print("  Risks:")
-        print("  - No TLS: traffic (including session token) is plaintext")
-        print("  - Anyone on your network can sniff the token and gain full access")
-        print("  - With the token, anyone can @mention agents and trigger tool execution")
+        print("  - No TLS: traffic (including tokens) is plaintext and can be sniffed")
+        print("  - A token holder can @mention agents and trigger tool execution")
         print("  - If agents run with auto-approve, this means remote code execution")
         print()
-        print("  Only use this on a trusted home network. Never on public/shared WiFi.")
+        print("  Only use this on a trusted network. Never on public/shared WiFi.")
         if "--allow-network" not in sys.argv:
             print("  Pass --allow-network to start anyway, or set host to 127.0.0.1.\n")
             sys.exit(1)
-        else:
-            print()
-            try:
-                confirm = input("  Type YES to accept these risks and start: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                confirm = ""
-            if confirm != "YES":
-                print("  Aborted.\n")
-                sys.exit(1)
+        print()
 
     print(f"\n  agentchattr")
     print(f"  Web UI:  http://{host}:{port}")
@@ -160,6 +186,31 @@ def main():
     print(f"\n  Session token: {session_token}\n")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+_LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>agentchattr - sign in</title>
+<style>
+body {{ background:#0f0f17; color:#e6e6eb; font-family:system-ui,sans-serif;
+       display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }}
+form {{ background:#181824; padding:28px; border-radius:10px; width:340px; }}
+h1 {{ font-size:18px; margin:0 0 6px; }} p {{ color:#9aa0a6; font-size:13px; margin:0 0 16px; }}
+input {{ width:100%; box-sizing:border-box; padding:9px; border-radius:6px; border:1px solid #333;
+        background:#0f0f17; color:inherit; font-family:monospace; }}
+button {{ margin-top:12px; width:100%; padding:9px; border:0; border-radius:6px;
+         background:#7c6af2; color:#fff; font-weight:600; cursor:pointer; }}
+.err {{ color:#ff6b6b; }}
+</style></head>
+<body><form method="post" action="/login">
+<h1>agentchattr</h1><p>Paste the token the server admin created for you
+(<code>python tokens.py add NAME --kind human</code>).</p>{error}
+<input name="token" type="password" placeholder="token" autofocus required>
+<button type="submit">Sign in</button>
+</form></body></html>"""
+
+
+def _login_page(error: str = "") -> str:
+    return _LOGIN_HTML.format(error=f'<p class="err">{error}</p>' if error else "")
 
 
 if __name__ == "__main__":

@@ -20,8 +20,9 @@ from summaries import SummaryStore
 from jobs import JobStore
 from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
-from agents import AgentTrigger
+from agents import AgentTrigger, RemoteOutbox
 from registry import RuntimeRegistry
+from tokens import TokenStore
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
 
@@ -40,6 +41,8 @@ agents: AgentTrigger | None = None
 registry: RuntimeRegistry | None = None
 session_store: SessionStore | None = None
 session_engine: SessionEngine | None = None
+tokens: TokenStore | None = None
+remote_outbox: RemoteOutbox | None = None
 config: dict = {}
 ws_clients: set[WebSocket] = set()
 
@@ -62,6 +65,7 @@ room_settings: dict = {
 
 # Channel validation
 _CHANNEL_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,19}$')
+_MEMBER_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,63}$')
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
@@ -191,6 +195,35 @@ def _resolve_authenticated_agent(request: Request) -> dict | None:
     return registry.resolve_token(token)
 
 
+def human_for_token(token: str) -> str | None:
+    """Name of the human client that owns `token` (tokens.py), or None."""
+    rec = tokens.resolve(token) if tokens and token else None
+    return rec["name"] if rec and rec["kind"] == "human" else None
+
+
+def _sync_tokens(force: bool = False):
+    """Push token-provisioned agent clients into the registry when tokens.json changes."""
+    if tokens and registry and (tokens.reload_if_changed() or force):
+        registry.sync_fixed(tokens.agents())
+
+
+def _resolve_fixed_token(token: str) -> str | None:
+    """registry.token_resolver: map a remote agent client's token to its name."""
+    rec = tokens.resolve(token) if tokens else None
+    if not rec or rec["kind"] == "human":
+        return None
+    _sync_tokens()
+    return rec["name"]
+
+
+def _same_host_origin(origin: str, host_header: str) -> bool:
+    from urllib.parse import urlsplit
+    try:
+        return bool(host_header) and urlsplit(origin).netloc.lower() == host_header.lower()
+    except ValueError:
+        return False
+
+
 # --- Security middleware ---
 # Paths that don't require the session token (public assets).
 _PUBLIC_PREFIXES = ("/", "/static/")
@@ -204,6 +237,7 @@ def _install_security_middleware(token: str, cfg: dict):
     allowed_origins = {
         f"http://127.0.0.1:{port}",
         f"http://localhost:{port}",
+        *cfg.get("server", {}).get("allowed_origins", []),
     }
 
     class SecurityMiddleware(BaseHTTPMiddleware):
@@ -215,7 +249,7 @@ def _install_security_middleware(token: str, cfg: dict):
             # Images keep their public preview URLs. Other attachments require
             # the browser session token, like the rest of the API.
             public_image = path.startswith("/uploads/") and Path(path).suffix.lower() in IMAGE_UPLOAD_EXTS
-            if path == "/" or path.startswith(("/static/", "/api/roles")) or public_image:
+            if path in ("/", "/login", "/logout") or path.startswith(("/static/", "/api/roles")) or public_image:
                 return await call_next(request)
 
             # Agent registration/heartbeat: loopback only (no remote agent minting).
@@ -228,9 +262,16 @@ def _install_security_middleware(token: str, cfg: dict):
                     )
                 return await call_next(request)
 
+            # Token clients on other machines authenticate per endpoint (Bearer).
+            if path.startswith("/api/agent/"):
+                return await call_next(request)
+
             # --- Origin check (blocks cross-origin / DNS-rebinding attacks) ---
+            # Same-origin pages are fine at any address: a rebinding page also
+            # matches here, but "/" only hands out a token to loopback names.
             origin = request.headers.get("origin")
-            if origin and origin not in allowed_origins:
+            if (origin and origin not in allowed_origins
+                    and not _same_host_origin(origin, request.headers.get("host", ""))):
                 return JSONResponse(
                     {"error": "forbidden: origin not allowed"},
                     status_code=403,
@@ -249,7 +290,7 @@ def _install_security_middleware(token: str, cfg: dict):
                 request.headers.get("x-session-token")
                 or request.query_params.get("token")
             )
-            if req_token != _self.session_token:
+            if req_token != _self.session_token and not human_for_token(req_token or ""):
                 return JSONResponse(
                     {"error": "forbidden: invalid or missing session token"},
                     status_code=403,
@@ -262,6 +303,7 @@ def _install_security_middleware(token: str, cfg: dict):
 
 def configure(cfg: dict, session_token: str = ""):
     global store, rules, summaries, jobs, schedules, router, agents, registry, session_store, session_engine, config
+    global tokens, remote_outbox
     config = cfg
     # --- Security: store the session token and install middleware ---
     _install_security_middleware(session_token, cfg)
@@ -309,6 +351,11 @@ def configure(cfg: dict, session_token: str = ""):
     registry.seed(cfg.get("agents", {}))
     registry.on_change(_on_registry_change)
 
+    # Per-client tokens for humans and agents on other machines (tokens.py)
+    tokens = TokenStore(Path(data_dir) / "tokens.json", reserved_bases=cfg.get("agents", {}).keys())
+    registry.token_resolver = _resolve_fixed_token
+    remote_outbox = RemoteOutbox()
+
     # Router starts with base agent names (backward compat for direct MCP users),
     # registry.on_change updates it dynamically when instances register/deregister
     agent_names = list(cfg.get("agents", {}).keys())
@@ -318,7 +365,8 @@ def configure(cfg: dict, session_token: str = ""):
         max_hops=max_hops,
         online_checker=lambda: set(registry.get_active_names()) if registry else set(),
     )
-    agents = AgentTrigger(registry, data_dir=data_dir)
+    agents = AgentTrigger(registry, data_dir=data_dir, remote=remote_outbox)
+    _sync_tokens(force=True)  # after the router exists, so token agents are @-mentionable
 
     # Sessions
     ROOT = Path(__file__).parent
@@ -354,6 +402,10 @@ def configure(cfg: dict, session_token: str = ""):
 
         while True:
             _time.sleep(3)
+            try:
+                _sync_tokens()
+            except Exception:
+                log.exception("token sync failed")
             # Recovery flags
             try:
                 for flag in _data_dir.glob("*_recovered"):
@@ -862,6 +914,18 @@ async def _handle_new_message(msg: dict):
             targets.append(t)
     targets = list(dict.fromkeys(targets))  # dedupe, preserve order
 
+    # A room with a member list only wakes its members
+    members = room_settings.get("channel_members", {}).get(channel)
+    if members:
+        outside = [t for t in targets if not _in_room(t, members)]
+        targets = [t for t in targets if t not in outside]
+        named = [t for t in outside if _re.search(rf"@{_re.escape(t)}(?![\w-])", text, _re.IGNORECASE)]
+        if named and sender not in known_agents:
+            store.add("system",
+                      f"Not a member of #{channel}: {', '.join('@' + t for t in named)}. "
+                      "Add them with the room members button.",
+                      channel=channel)
+
     if router.is_paused(channel):
         # Only emit the loop guard notice once per pause
         if not router.is_guard_emitted(channel):
@@ -898,6 +962,14 @@ async def _handle_new_message(msg: dict):
             store.add("system", f"{target} appears offline — message queued.", msg_type="system", channel=channel)
         if agents.is_available(target):
             await agents.trigger(target, message=chat_msg, channel=channel, prompt=custom_prompt)
+
+
+def _in_room(name: str, members: list[str]) -> bool:
+    """Members are agent names; a legacy family name (e.g. 'claude') covers its slots."""
+    if name in members:
+        return True
+    inst = registry.get_instance(name) if registry else None
+    return bool(inst and inst.get("base") in members)
 
 
 # --- broadcasting ---
@@ -1073,7 +1145,10 @@ def _on_registry_change():
 async def websocket_endpoint(websocket: WebSocket):
     # --- Security: validate session token on WebSocket connect ---
     token = websocket.query_params.get("token", "")
-    if token != session_token:
+    # A human token (tokens.py) pins this socket's sender name; the session
+    # token keeps the legacy single-user behaviour.
+    ws_human = human_for_token(token) if token != session_token else None
+    if token != session_token and not ws_human:
         # Must accept before closing so the browser receives the close frame.
         # Code 4003 triggers an auto-reload in the client to pick up the new token.
         await websocket.accept()
@@ -1154,7 +1229,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if event.get("type") == "message":
                 text = event.get("text", "").strip()
                 attachments = event.get("attachments", [])
-                sender = event.get("sender") or room_settings.get("username", "user")
+                sender = ws_human or event.get("sender") or room_settings.get("username", "user")
                 channel = event.get("channel", "general")
 
                 if not text and not attachments:
@@ -1232,9 +1307,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif event.get("type") in ("decision_propose", "rule_propose"):
                 text = event.get("text") or event.get("decision", "")
                 text = text.strip()
-                author = event.get("author") or event.get("owner") or room_settings.get("username", "user")
+                author = ws_human or event.get("author") or event.get("owner") or room_settings.get("username", "user")
                 reason = event.get("reason", "")
-                is_human = author.lower() == room_settings.get("username", "user").lower()
+                is_human = bool(ws_human) or author.lower() == room_settings.get("username", "user").lower()
                 if text:
                     rule = rules.propose(text, author, reason)
                     if rule:
@@ -1306,7 +1381,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "title" in new and isinstance(new["title"], str):
                     room_settings["title"] = new["title"].strip() or "agentchattr"
                 apply_room_subtitle(new)
-                if "username" in new and isinstance(new["username"], str):
+                # Token humans have their own name; the shared one is the local user's.
+                if "username" in new and isinstance(new["username"], str) and not ws_human:
                     room_settings["username"] = new["username"].strip() or "user"
                 if "font" in new and new["font"] in ("mono", "serif", "sans"):
                     room_settings["font"] = new["font"]
@@ -1416,6 +1492,21 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await _broadcast(rename_event)
                 continue
 
+            elif event.get("type") == "channel_members":
+                name = (event.get("channel") or "").strip().lower()
+                members = event.get("members")
+                if name not in room_settings["channels"] or not isinstance(members, list):
+                    continue
+                cleaned = sorted({m.strip().lower() for m in members
+                                  if isinstance(m, str) and _MEMBER_NAME_RE.match(m.strip().lower())})
+                room_members = room_settings.setdefault("channel_members", {})
+                if cleaned:
+                    room_members[name] = cleaned
+                else:
+                    room_members.pop(name, None)  # empty list = open room
+                _save_settings()
+                await broadcast_settings()
+
             elif event.get("type") == "channel_create":
                 name = (event.get("name") or "").strip().lower()
                 if not name or not _CHANNEL_NAME_RE.match(name):
@@ -1439,6 +1530,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 idx = room_settings["channels"].index(old_name)
                 room_settings["channels"][idx] = new_name
+                room_members = room_settings.get("channel_members", {})
+                if old_name in room_members:
+                    room_members[new_name] = room_members.pop(old_name)
                 store.rename_channel(old_name, new_name)
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_rename(old_name, new_name)
@@ -1463,6 +1557,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if name not in room_settings["channels"]:
                     continue
                 room_settings["channels"].remove(name)
+                room_settings.get("channel_members", {}).pop(name, None)
                 store.delete_channel(name)
                 import mcp_bridge
                 mcp_bridge.migrate_cursors_delete(name)
@@ -2361,6 +2456,108 @@ async def heartbeat(agent_name: str, request: Request):
                 with mcp_bridge._presence_lock:
                     mcp_bridge._presence[canonical] = now
     return resp
+
+
+# --- Token clients on other machines (client.py) ---
+
+def _agent_client(request: Request) -> dict | None:
+    """Live instance of the token client presenting a Bearer token, or None."""
+    token = _extract_agent_token(request)
+    inst = registry.resolve_token(token) if (registry and token) else None
+    return inst if inst and registry.is_fixed(inst["name"]) else None
+
+
+def _touch_agent(name: str):
+    import mcp_bridge
+    import time as _time
+    with mcp_bridge._presence_lock:
+        mcp_bridge._presence[name] = _time.time()
+
+
+_AGENT_AUTH_ERROR = {"error": "invalid or revoked agent token"}
+
+
+@app.get("/api/agent/me")
+async def agent_me(request: Request, announce: int = 0):
+    """Who am I, and where is MCP. `announce=1` posts the join message (client start)."""
+    inst = _agent_client(request)
+    if not inst:
+        return JSONResponse(_AGENT_AUTH_ERROR, status_code=401)
+    name = inst["name"]
+    _touch_agent(name)
+    if announce:
+        store.add(name, f"{name} is online", msg_type="join", channel="general")
+    host = request.url.hostname or "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    mcp_port = config.get("mcp", {}).get("http_port", 8200)
+    base_cfg = registry.get_base_config(name) or {}
+    return {
+        "name": name,
+        "label": inst["label"],
+        "kind": base_cfg.get("kind", ""),
+        "mcp_url": f"http://{host}:{mcp_port}/mcp",
+        "boot": remote_outbox.boot,
+    }
+
+
+@app.get("/api/agent/wait")
+async def agent_wait(request: Request, after: int = 0, boot: str = "", timeout: float = 20):
+    """Long-poll for wake-ups. Keeps the client's presence alive while waiting."""
+    import time as _time
+    inst = _agent_client(request)
+    if not inst:
+        return JSONResponse(_AGENT_AUTH_ERROR, status_code=401)
+    name = inst["name"]
+    token = _extract_agent_token(request)
+    deadline = _time.monotonic() + max(0.0, min(timeout, 25.0))
+    while True:
+        _touch_agent(name)
+        pending = remote_outbox.take(name, after, boot)
+        if pending or _time.monotonic() >= deadline or await request.is_disconnected():
+            break
+        await asyncio.sleep(0.5)
+        # Revocation takes effect mid-poll; a crash-timeout deregistration revives here.
+        if not registry.resolve_token(token):
+            return JSONResponse(_AGENT_AUTH_ERROR, status_code=401)
+    return {
+        "boot": remote_outbox.boot,
+        "triggers": [{"seq": seq, **entry} for seq, entry in pending],
+    }
+
+
+@app.post("/api/agent/activity")
+async def agent_activity(request: Request):
+    """Busy/idle report from the client (Codex turn events, Claude hooks)."""
+    import mcp_bridge
+    inst = _agent_client(request)
+    if not inst:
+        return JSONResponse(_AGENT_AUTH_ERROR, status_code=401)
+    try:
+        active = bool((await request.json()).get("active"))
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    name = inst["name"]
+    _touch_agent(name)
+    was_active = mcp_bridge.is_active(name)
+    mcp_bridge.set_active(name, active)
+    if was_active != active:
+        await broadcast_status()
+    return {"ok": True}
+
+
+@app.post("/api/agent/disconnect")
+async def agent_disconnect(request: Request):
+    """Client exit. The token stays valid; the next request brings the identity back."""
+    import mcp_bridge
+    inst = _agent_client(request)
+    if not inst:
+        return JSONResponse(_AGENT_AUTH_ERROR, status_code=401)
+    name = inst["name"]
+    registry.deregister(name)
+    mcp_bridge.purge_identity(name, keep_role=True)
+    remote_outbox.drop(name)
+    return {"ok": True}
 
 
 # --- Open agent session in terminal ---

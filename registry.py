@@ -7,6 +7,7 @@ Thread-safe: a single threading.Lock guards all mutations.
 """
 
 import colorsys
+import hashlib
 import json
 import secrets
 import threading
@@ -29,6 +30,7 @@ class Instance:
     epoch: int = 1
     state: str = "pending"   # "pending" | "active"
     registered_at: float = field(default_factory=time.time)
+    fixed: bool = False      # token-provisioned remote client (tokens.py), never persisted
 
 
 class RuntimeRegistry:
@@ -42,6 +44,10 @@ class RuntimeRegistry:
         self._renames: dict[str, str] = {}           # old name → new name (for heartbeat redirect)
         self._reclaimable: dict[str, Instance] = {}  # name → deregistered Instance, recoverable on reconnect
         self._on_change_cbs: list = []
+        self._fixed_bases: set[str] = set()          # names provisioned by tokens.py
+        # Optional callable(token) -> fixed client name. Lets a remote client's
+        # token resolve after a server restart, when its instance is not live yet.
+        self.token_resolver = None
         self._data_dir = Path(data_dir)
         self._load_renames()
         self._load_instances()
@@ -105,8 +111,8 @@ class RuntimeRegistry:
             self._data_dir.mkdir(parents=True, exist_ok=True)
             with self._lock:
                 data = {
-                    "instances": {n: _inst_full(i) for n, i in self._instances.items()},
-                    "reclaimable": {n: _inst_full(i) for n, i in self._reclaimable.items()},
+                    "instances": {n: _inst_full(i) for n, i in self._instances.items() if not i.fixed},
+                    "reclaimable": {n: _inst_full(i) for n, i in self._reclaimable.items() if not i.fixed},
                 }
             tmp = self._instances_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(data), "utf-8")
@@ -190,7 +196,7 @@ class RuntimeRegistry:
         to prevent identity ambiguity. The rename info is returned as '_renamed_slot1'.
         """
         with self._lock:
-            if base not in self._bases:
+            if base not in self._bases or base in self._fixed_bases:
                 return None
 
             self._expire_reserved()
@@ -351,6 +357,8 @@ class RuntimeRegistry:
 
             if not inst:
                 error = f"No available {sender} instance. Is a wrapper registered?"
+            elif inst.fixed and target_name not in (None, inst.name):
+                error = f"{inst.name} is a token identity and can't be renamed"
             elif target_name is None or target_name == inst.name:
                 # Accept current name — but don't auto-activate pending instances.
                 # Pending instances must be named by human (lightbox) or reclaimed
@@ -444,6 +452,8 @@ class RuntimeRegistry:
                 if label:
                     inst.label = label
                 result = _inst_dict(inst)
+            elif inst.fixed:
+                return f"{old_name} is a token identity and can't be renamed"
             elif new_name in self._instances:
                 return f"Already taken: {new_name}"
             elif (family_err := self._conflicts_with_other_family(new_name, inst.base)):
@@ -671,7 +681,68 @@ class RuntimeRegistry:
             self._notify()
         if changed:
             self._save_instances()
+        if result is None and self.token_resolver is not None:
+            name = self.token_resolver(token)
+            if name:
+                result = self.register_fixed(name, token)
         return result
+
+    # --- Token-provisioned remote clients ---
+
+    def sync_fixed(self, clients: dict[str, dict]):
+        """Replace the set of token-provisioned agent families.
+
+        `clients` maps name -> {label, color, kind, token_sha256} (tokens.py).
+        Each client is its own one-member family, so slot numbering and the
+        slot-1 rename never touch it. Revoked or re-issued tokens drop the live
+        instance so the old token stops working at once.
+        """
+        changed = False
+        with self._lock:
+            for name in self._fixed_bases - set(clients):
+                self._bases.pop(name, None)
+                self._reclaimable.pop(name, None)
+                if name in self._instances and self._instances[name].fixed:
+                    del self._instances[name]
+                changed = True
+            for name, cfg in clients.items():
+                if self._bases.get(name) != cfg:
+                    self._bases[name] = dict(cfg)
+                    changed = True
+                digest = cfg.get("token_sha256")
+                for pool in (self._instances, self._reclaimable):
+                    inst = pool.get(name)
+                    if inst and inst.fixed and digest and _digest(inst.token) != digest:
+                        del pool[name]
+                        changed = True
+            self._fixed_bases = set(clients)
+        if changed:
+            self._notify()
+
+    def register_fixed(self, name: str, token: str) -> dict | None:
+        """Make the token-provisioned client `name` live, authenticated by `token`."""
+        with self._lock:
+            if name not in self._fixed_bases:
+                return None
+            inst = self._instances.get(name)
+            if inst is None:
+                inst = self._reclaimable.pop(name, None)
+                if inst is None:
+                    cfg = self._bases[name]
+                    inst = Instance(name=name, base=name, slot=1,
+                                    label=cfg.get("label", name), color=cfg.get("color", "#888"),
+                                    fixed=True)
+                self._instances[name] = inst
+            inst.token = token
+            inst.state = "active"
+            self._reserved.pop(name, None)
+            result = _inst_dict(inst)
+        self._notify()
+        return result
+
+    def is_fixed(self, name: str) -> bool:
+        with self._lock:
+            return name in self._fixed_bases
 
     def get_pending(self) -> list[dict]:
         """All pending instances (for timeout checks)."""
@@ -726,6 +797,10 @@ class RuntimeRegistry:
 
 
 # --- Module-level helpers ---
+
+def _digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
     d = {

@@ -12,7 +12,9 @@ import logging
 import threading
 from pathlib import Path
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
+
+from tokens import is_local_request
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +120,8 @@ _MCP_INSTRUCTIONS = (
     "A task is scoped if it has: 1) Concrete outcome, 2) Specific boundary, 3) Clear done criteria, 4) Explicit owner/intention, and 5) Appropriate size. "
     "If these 5 checks do not pass, do NOT propose a job; instead, reply in chat to ask for clarification. "
     "This prevents over-use of the jobs feature for vague requests.\n\n"
+    "Attachments in chat_read carry a file_path on the chat server's disk. If you run on a different "
+    "machine, call chat_attachment(url=...) with the attachment's url instead of opening file_path.\n\n"
     "To post a suggestion (Accept/Dismiss card) in a job, prefix your message with [suggestion]: "
     "chat_send(job_id=N, message='[suggestion] I recommend we refactor the auth module'). "
     "The human can Accept (triggers you with context) or Dismiss."
@@ -406,6 +410,37 @@ def _resolve_attachments(attachments: list[dict]) -> list[dict]:
     return resolved
 
 
+_FETCHABLE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_MAX_TEXT_ATTACHMENT = 256 * 1024
+
+
+def chat_attachment(url: str):
+    """Fetch a chat attachment by its url (e.g. '/uploads/ab12cd.png').
+
+    Use this when an attachment's file_path is not on your machine (you run on
+    a different computer than the chat server). Images come back as images,
+    text files (up to 256 KB) as text."""
+    name = url.split("/uploads/", 1)[1] if "/uploads/" in url else ""
+    if not name or "/" in name or "\\" in name:
+        return "Error: pass an attachment url like /uploads/<file>."
+    raw_dir = "./uploads"
+    if config and "images" in config:
+        raw_dir = config["images"].get("upload_dir", raw_dir)
+    upload_dir = Path(raw_dir).resolve()
+    path = (upload_dir / name).resolve()
+    if not path.is_relative_to(upload_dir) or not path.is_file():
+        return f"Error: attachment not found: {url}"
+    if path.suffix.lower() in _FETCHABLE_IMAGE_EXTS:
+        return Image(path=str(path))
+    data = path.read_bytes()
+    if len(data) > _MAX_TEXT_ATTACHMENT:
+        return f"Error: {path.name} is {len(data)} bytes; only files up to 256 KB can be fetched."
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"Error: {path.name} is a binary file and can't be fetched as text."
+
+
 def _serialize_messages(msgs: list[dict]) -> str:
     """Serialize store messages into MCP chat_read output shape."""
     out = []
@@ -521,8 +556,11 @@ def migrate_identity(old_name: str, new_name: str):
     _save_cursors()
 
 
-def purge_identity(name: str):
-    """Remove all runtime state for a deregistered agent (presence, activity, cursors, roles)."""
+def purge_identity(name: str, keep_role: bool = False):
+    """Remove all runtime state for a deregistered agent (presence, activity, cursors, roles).
+
+    Token clients keep their name across sessions, so they keep their role (keep_role=True).
+    """
     with _presence_lock:
         _presence.pop(name, None)
         _activity.pop(name, None)
@@ -532,7 +570,7 @@ def purge_identity(name: str):
     with _last_read_lock:
         _last_read_channel.pop(name, None)
         _last_read_job_id.pop(name, None)
-    if name in _roles:
+    if name in _roles and not keep_role:
         del _roles[name]
         _save_roles()
     _save_cursors()
@@ -942,7 +980,7 @@ def chat_summary(
 
 _ALL_TOOLS = [
     chat_send, chat_read, chat_resync, chat_join, chat_who, chat_rules, chat_decision,
-    chat_channels, chat_set_hat, chat_claim, chat_summary, chat_propose_job,
+    chat_channels, chat_set_hat, chat_claim, chat_summary, chat_propose_job, chat_attachment,
 ]
 
 
@@ -966,12 +1004,59 @@ mcp_sse = _create_server(8201)   # SSE for Gemini
 # (store is set by run.py before starting)
 
 
+def configure_network(host: str):
+    """Bind both MCP servers to `host` (server.host).
+
+    Off loopback, FastMCP's localhost-only Host check would reject every LAN
+    client, so it is replaced by _TokenGate: a valid agent token is required
+    unless the request is local.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+    for server in (mcp_http, mcp_sse):
+        server.settings.host = host
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            server.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False)
+
+
+class _TokenGate:
+    """ASGI wrapper: MCP requests from other machines need a registered agent token."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                       for k, v in scope.get("headers", [])}
+            client = (scope.get("client") or ("", 0))[0]
+            if not is_local_request(client, headers.get("host", "")):
+                auth = headers.get("authorization", "")
+                token = auth[7:].strip() if auth.lower().startswith("bearer ") \
+                    else headers.get("x-agent-token", "").strip()
+                if not (token and registry and registry.resolve_token(token)):
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body",
+                                "body": b'{"error": "agent token required"}'})
+                    return
+        await self.app(scope, receive, send)
+
+
+def _serve(starlette_app, server: FastMCP):
+    import asyncio
+    import uvicorn
+    cfg = uvicorn.Config(_TokenGate(starlette_app), host=server.settings.host,
+                         port=server.settings.port, log_level=server.settings.log_level.lower())
+    asyncio.run(uvicorn.Server(cfg).serve())
+
+
 def run_http_server():
     """Block — run streamable-http MCP in a background thread."""
-    mcp_http.run(transport="streamable-http")
+    _serve(mcp_http.streamable_http_app(), mcp_http)
 
 
 def run_sse_server():
     """Block — run SSE MCP in a background thread."""
-    mcp_sse.run(transport="sse")
+    _serve(mcp_sse.sse_app(), mcp_sse)
 

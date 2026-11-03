@@ -6,6 +6,7 @@ __pycache__/
 *.pyo
 .env
 config.local.toml
+client.local.toml
 *.log
 .DS_Store
 Thumbs.db

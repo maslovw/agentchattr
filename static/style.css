@@ -3216,6 +3216,41 @@ footer {
     color: var(--agent-color, var(--accent));
 }
 
+/* --- Room members --- */
+.room-members-btn {
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: 14px;
+    color: var(--text-dim);
+    padding: 3px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.room-members-btn:hover { color: var(--accent); border-color: var(--accent); }
+.room-members-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+.room-members-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--agent-color);
+    cursor: pointer;
+}
+.room-members-row input { accent-color: var(--agent-color); }
+.room-members-hint {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
 #attachments {
     display: flex;
     gap: 8px;

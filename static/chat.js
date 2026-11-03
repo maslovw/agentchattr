@@ -3,6 +3,8 @@
 // Session token injected by the server into the HTML page.
 // Sent with every API call and WebSocket connection to authenticate.
 const SESSION_TOKEN = window.__SESSION_TOKEN__ || "";
+// Set when signed in with a personal token (tokens.py); the server pins it as the sender.
+const HUMAN_NAME = window.__HUMAN_NAME__ || "";
 
 let ws = null;
 let pendingAttachments = [];
@@ -28,6 +30,7 @@ let agentHats = {};  // { agent_name: svg_string }
 window.customRoles = [];  // saved custom roles from settings
 let colorOverrides = JSON.parse(localStorage.getItem('agentchattr-color-overrides') || '{}');
 let schedulesList = [];  // array of schedule objects from server
+let channelMembers = {};  // channel -> [agent names]; no entry = open room
 
 // Expose globals that extracted modules (sessions.js, jobs.js) read via window.*
 // Using defineProperty so live values are always returned.
@@ -1907,10 +1910,13 @@ function applySettings(data) {
         const subInput = document.getElementById('setting-subtitle');
         if (subInput) subInput.value = data.subtitle;
     }
-    if (data.username) {
-        username = data.username;
+    if (data.username || HUMAN_NAME) {
+        username = HUMAN_NAME || data.username;
         document.getElementById('sender-label').textContent = username;
-        document.getElementById('setting-username').value = username;
+        const nameInput = document.getElementById('setting-username');
+        nameInput.value = username;
+        nameInput.disabled = !!HUMAN_NAME;
+        if (HUMAN_NAME) nameInput.title = 'Your name comes from your sign-in token';
     }
     if (data.font) {
         document.body.classList.remove('font-mono', 'font-serif', 'font-sans');
@@ -1934,6 +1940,8 @@ function applySettings(data) {
         window.customRoles = data.custom_roles;
     }
     if (data.channels && Array.isArray(data.channels)) {
+        channelMembers = data.channel_members || {};
+        buildMentionToggles();
         channelList = data.channels;
         // If active channel was deleted, switch to general
         if (!channelList.includes(activeChannel)) {
@@ -3097,20 +3105,96 @@ window._onChannelSwitchMentions = function(oldChannel, newChannel) {
     for (const btn of document.querySelectorAll('.mention-toggle')) {
         btn.classList.toggle('active', activeMentions.has(btn.dataset.agent));
     }
+    buildMentionToggles();  // the new room may have a different member list
     if (typeof updateSchedulePopoverState === 'function') updateSchedulePopoverState();
 };
+
+// --- Room members ---
+// A room with a member list only wakes its members (routing is enforced by the
+// server); its toggles show members only. A room without a list is open.
+
+function roomMembers(channel) {
+    return channelMembers[channel] || [];
+}
+
+function isRoomMember(name, members) {
+    if (!members.length) return true;
+    const cfg = agentConfig[name];
+    return members.includes(name) || !!(cfg && members.includes(cfg.base));
+}
+
+function toggleRoomMembersPopover(anchor) {
+    const existing = document.querySelector('.room-members-popover');
+    if (existing) { existing.remove(); return; }
+
+    const channel = activeChannel;
+    const members = new Set(roomMembers(channel));
+    // Connected agents, plus members that are offline right now
+    const live = Object.keys(agentConfig).filter(n => agentConfig[n].state !== 'pending');
+    const names = [...new Set([...live, ...members])].sort();
+
+    const pop = document.createElement('div');
+    pop.className = 'pill-popover room-members-popover';
+    pop.innerHTML = `<div class="pill-popover-section">
+        <label class="pill-popover-label">Members of #${escapeHtml(channel)}</label>
+        <div class="room-members-list"></div>
+        <div class="room-members-hint"></div>
+    </div>`;
+    const list = pop.querySelector('.room-members-list');
+    const hint = pop.querySelector('.room-members-hint');
+    const updateHint = () => {
+        hint.textContent = members.size
+            ? 'Only checked agents are woken in this room.'
+            : 'Nobody checked: the room is open to every agent.';
+    };
+    for (const name of names) {
+        const cfg = agentConfig[name];
+        const row = document.createElement('label');
+        row.className = 'room-members-row';
+        row.style.setProperty('--agent-color', colorOverrides[name] || (cfg && cfg.color) || '#888');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = members.has(name);
+        cb.onchange = () => {
+            if (cb.checked) members.add(name); else members.delete(name);
+            updateHint();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'channel_members', channel, members: [...members] }));
+            }
+        };
+        const label = document.createElement('span');
+        label.textContent = cfg ? `${cfg.label || name} (@${name})` : `@${name} (offline)`;
+        row.append(cb, label);
+        list.appendChild(row);
+    }
+    if (!names.length) list.textContent = 'No agents connected yet.';
+    updateHint();
+
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = `${Math.max(8, r.left)}px`;
+    pop.style.bottom = `${window.innerHeight - r.top + 6}px`;
+    document.body.appendChild(pop);
+    const onDocClick = (e) => {
+        if (pop.contains(e.target)) return;
+        pop.remove();
+        document.removeEventListener('click', onDocClick);
+    };
+    setTimeout(() => document.addEventListener('click', onDocClick), 0);
+}
 
 function buildMentionToggles() {
     const container = document.getElementById('mention-toggles');
     container.innerHTML = '';
+    const members = roomMembers(activeChannel);
 
-    // Prune stale mentions for agents no longer in config
+    // Prune stale mentions for agents no longer in config or not in this room
     for (const name of activeMentions) {
-        if (!(name in agentConfig)) activeMentions.delete(name);
+        if (!(name in agentConfig) || !isRoomMember(name, members)) activeMentions.delete(name);
     }
 
     for (const [name, cfg] of Object.entries(agentConfig)) {
         if (cfg.state === 'pending') continue;  // skip pending instances
+        if (!isRoomMember(name, members)) continue;
         const btn = document.createElement('button');
         btn.className = 'mention-toggle';
         btn.dataset.agent = name;
@@ -3133,6 +3217,15 @@ function buildMentionToggles() {
         };
         container.appendChild(btn);
     }
+
+    const membersBtn = document.createElement('button');
+    membersBtn.className = 'room-members-btn';
+    membersBtn.textContent = members.length ? `Members (${members.length})` : '+ Members';
+    membersBtn.title = members.length
+        ? `Only members of #${activeChannel} are woken`
+        : `#${activeChannel} is open to every agent. Add members to limit it.`;
+    membersBtn.onclick = (e) => { e.stopPropagation(); toggleRoomMembersPopover(membersBtn); };
+    container.appendChild(membersBtn);
     enableDragScroll(container);
 }
 

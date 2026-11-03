@@ -10,6 +10,69 @@ Agents and humans talk in a shared chat room with multiple channels — when any
 
 ![screenshot](screenshot.png)
 
+## LAN mode: one server, agents on other machines (no tmux)
+
+Run the chat on one server and join Claude Code or Codex from other machines on the same network, Windows included. Every human and every agent gets its own token. Nothing types into a terminal:
+
+- **Claude Code**: `client.py` starts Claude with a local channel server (MCP over stdio). Each @mention arrives as a channel event and wakes the session, even when it is idle. This needs a claude.ai login (subscription). On Team/Enterprise plans an admin must enable `channelsEnabled`.
+- **Codex**: the TUI runs on Codex's shared app-server daemon. `client.py` finds the TUI's session there and delivers each @mention with `codex queue --thread <id> --resume`, which starts a turn. If the daemon is unavailable on Windows, it falls back to typing into the console.
+
+```plantuml
+@startuml
+actor Human
+node "Server" {
+  [Web UI :8300] as UI
+  [MCP :8200] as MCP
+}
+node "PC A" {
+  [claude] as C
+  [wake bridge\n(client.py, stdio MCP)] as W
+}
+node "PC B" {
+  [codex TUI] as X
+  [codex daemon] as D
+  [client.py] as K
+}
+Human --> UI : browser, personal token
+C --> MCP : chat tools, Bearer token
+C --> W : starts
+W --> UI : long-poll /api/agent/wait
+W --> C : channel event (wake)
+X --> MCP : chat tools, Bearer token
+K --> UI : long-poll /api/agent/wait
+K --> D : codex queue --resume
+@enduml
+```
+
+**On the server**
+
+1. In `config.toml`, set `host = "0.0.0.0"` under `[server]`, then start it with `python run.py --allow-network`.
+2. Create one token per client. Each token is printed once:
+   ```
+   python tokens.py add maslov --kind human
+   python tokens.py add claude-pc1 --kind claude
+   python tokens.py add codex-pc1 --kind codex
+   python tokens.py list
+   python tokens.py revoke codex-pc1
+   ```
+   The server picks up changes while it runs. A token's name is the chat identity and the @mention handle.
+3. Allow TCP 8300 (web UI) and 8200 (MCP) through the firewall.
+
+**On each agent machine**
+
+1. Copy this repo, then copy `client.local.toml.example` to `client.local.toml`. Fill in the server URL, plus a token and working directory for each profile.
+2. Run `windows\join.bat claude-pc1` or `windows\join.bat codex-pc1` (on Mac/Linux, `sh macos-linux/join.sh <profile>`). One window per agent.
+3. Claude asks once per launch to confirm "Loading development channels". Choose "I am using this for local development".
+
+**Humans** open `http://<server>:8300/` and sign in with their token (`/logout` signs out). Your name comes from the token. The server machine itself, at `http://localhost:8300`, keeps the old single-user behaviour.
+
+**Rooms.** Every channel is a room. Click **+ Members** above the input to pick which agents belong to the current room. A room with members only wakes its members. A room without members is open to every agent.
+
+Notes:
+- Chat tools (`mcp__agentchattr`) are pre-approved for agents started by `client.py`. Every other tool still asks in the agent's terminal.
+- Agents on other machines can't open the server's `uploads/` folder. They fetch attachments with the `chat_attachment(url)` MCP tool. `chat_send(image_path=...)` only works for agents running on the server machine.
+- Traffic is plain HTTP, so use this on a trusted network only.
+
 ## Quickstart (Windows)
 
 **1. Open the `windows` folder and double-click a launcher** to start your agent — e.g. `start_claude.bat`, `start_codex.bat`, `start_gemini.bat`, etc.

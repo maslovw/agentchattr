@@ -1,0 +1,16 @@
+# Copy to client.local.toml (gitignored) on each machine that runs an agent.
+# Tokens come from the server admin: python tokens.py add <name> --kind claude|codex
+# Then start one agent per window: windows\join.bat <profile>  (or sh macos-linux/join.sh <profile>)
+
+server = "http://chat-server:8300"
+
+[profiles.claude-pc1]
+token = "paste-the-token-here"
+cwd = "C:/work/myrepo"
+# Extra CLI arguments for claude, e.g. ["--model", "opus"]
+# args = []
+
+[profiles.codex-pc1]
+token = "paste-the-token-here"
+cwd = "C:/work/myrepo"
+# args = ["--dangerously-bypass-approvals-and-sandbox"]

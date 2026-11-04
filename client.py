@@ -4,7 +4,7 @@ No tmux and no typing into the terminal:
   - Claude Code: a local channel server (MCP over stdio, started by Claude) gets
     each @mention from the chat server and pushes it into the session as a
     channel event, which wakes the session when it is idle.
-  - Codex: the TUI runs on Codex's shared app-server daemon. Each @mention is
+  - Codex: the TUI runs on a client-owned local app server. Each @mention is
     delivered with `codex queue --thread <id> --resume`, which starts a turn.
 
 The token decides who you are and whether Claude or Codex is started. Create it
@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -354,7 +355,7 @@ def run_claude(api: Api, me: dict, cwd: Path, extra: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Codex: shared app-server daemon + codex queue
+# Codex: client-owned app server + codex queue
 # ---------------------------------------------------------------------------
 
 def _codex_argv() -> list[str] | None:
@@ -382,18 +383,19 @@ def _shell_safe(text: str) -> str:
 
 
 class CodexRpc:
-    """JSON-RPC to Codex's shared app-server daemon via `codex app-server proxy`.
+    """JSON-RPC to a local app server via `codex app-server proxy --sock`.
 
-    The daemon's control socket speaks WebSocket. The proxy relays its bytes
+    The server's control socket speaks WebSocket. The proxy relays its bytes
     over stdio, which behaves the same on every platform, and the websockets
     sans-I/O protocol does the framing.
     """
 
-    def __init__(self, argv: list[str], cwd: Path, env: dict):
+    def __init__(self, argv: list[str], cwd: Path, env: dict, socket_path: str = ""):
         from websockets.client import ClientProtocol
         from websockets.uri import parse_uri
 
-        self._proc = subprocess.Popen([*argv, "app-server", "proxy"], cwd=str(cwd), env=env,
+        socket_flags = ["--sock", socket_path] if socket_path else []
+        self._proc = subprocess.Popen([*argv, "app-server", "proxy", *socket_flags], cwd=str(cwd), env=env,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL)
         self._proto = ClientProtocol(parse_uri("ws://localhost/"), max_size=None)
@@ -509,28 +511,60 @@ class CodexLink:
     """Finds the TUI's thread on the daemon, reports busy/idle, delivers wake-ups."""
 
     def __init__(self, argv: list[str], cwd: Path, env: dict, reporter: ActivityReporter,
-                 name: str, inject=None):
+                 name: str, inject=None, mcp_flags=()):
         self.argv, self.cwd, self.env = argv, cwd, env
         self.reporter, self.name, self.inject = reporter, name, inject
         self.rpc: CodexRpc | None = None
         self.thread_id = ""
         self._known: set[str] = set()
         self._linked = threading.Event()
+        self.mcp_flags = list(mcp_flags)
+        self._server = None
+        self._socket_dir = None
+        self.remote = ""
 
     def connect(self) -> bool:
-        started = subprocess.run([*self.argv, "app-server", "daemon", "start"], cwd=str(self.cwd),
-                                 env=self.env, capture_output=True, text=True)
-        if started.returncode != 0:
-            log(f"codex app-server daemon did not start: {started.stderr.strip()[-300:]}")
-            return False
         try:
-            self.rpc = CodexRpc(self.argv, self.cwd, self.env)
+            # A remote TUI does not forward arbitrary -c MCP overrides. Host
+            # them on our own server instead; never mutate/restart the shared
+            # daemon or write credentials into the user's config/profile.
+            self._socket_dir = tempfile.TemporaryDirectory(prefix="ac-")
+            socket_path = str(Path(self._socket_dir.name) / "s")
+            self.remote = "unix://" + socket_path
+            self._server = subprocess.Popen(
+                [*self.argv, "app-server", *self.mcp_flags, "--listen", self.remote],
+                cwd=str(self.cwd), env=self.env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 15
+            while not Path(socket_path).exists():
+                if self._server.poll() is not None:
+                    raise RuntimeError("client app server exited during startup")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("client app-server socket did not become ready")
+                time.sleep(0.05)
+            self.rpc = CodexRpc(self.argv, self.cwd, self.env, socket_path=socket_path)
             self._known = set(self.rpc.loaded_threads())  # threads that are not ours
         except Exception as exc:
-            log(f"cannot talk to the Codex daemon: {exc}")
-            self.rpc = None
+            log(f"cannot start the client Codex app server: {type(exc).__name__}")
+            self.close()
             return False
         return True
+
+    def close(self):
+        if self.rpc:
+            self.rpc.close()
+            self.rpc = None
+        if self._server:
+            self._server.terminate()
+            try:
+                self._server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._server.kill()
+                self._server.wait()
+            self._server = None
+        if self._socket_dir:
+            self._socket_dir.cleanup()
+            self._socket_dir = None
 
     def watch(self, alive, stop: threading.Event):
         """Until the TUI exits: link its thread (and later /new threads), poll status."""
@@ -570,7 +604,7 @@ class CodexLink:
         via_cmd_shim = self.argv[0].lower().endswith((".cmd", ".bat"))
         message = _shell_safe(prompt) if via_cmd_shim else prompt
         result = subprocess.run([*self.argv, "queue", "--thread", self.thread_id,
-                                 "--message", message, "--resume"],
+                                 "--message", message, "--resume", "--remote", self.remote],
                                 cwd=str(self.cwd), env=self.env, capture_output=True, text=True)
         if result.returncode != 0:
             log(f"codex queue failed: {(result.stderr or result.stdout).strip()[-300:]}")
@@ -589,37 +623,36 @@ def run_codex(api: Api, me: dict, cwd: Path, extra: list[str]) -> int:
 
     inject = None
     if sys.platform == "win32":
-        # Codex's TUI needs VT processing on the console; the console injector
-        # is the fallback when the daemon path is not available on this machine.
+        # Codex's TUI needs VT processing on the console; injection remains a
+        # fallback if a wake arrives before the thread is linked.
         from wrapper_windows import _vt_keepalive_thread, enable_vt_mode, inject as win_inject
         enable_vt_mode()
         _vt_keepalive_thread()
         inject = win_inject
 
-    link = CodexLink(argv, cwd, env, reporter, me["name"], inject=inject)
-    if not link.connect() and not inject:
-        log("without the Codex daemon this client cannot wake Codex on this platform")
-
     mcp_flags = [
-        "-c", f'mcp_servers.agentchattr.url="{me["mcp_url"]}"',
-        "-c", f'mcp_servers.agentchattr.http_headers={{Authorization="Bearer {api.token}"}}',
+        "-c", f'mcp_servers.agentchattr.url={json.dumps(me["mcp_url"])}',
+        "-c", f'mcp_servers.agentchattr.http_headers={{Authorization={json.dumps("Bearer " + api.token)}}}',
         "-c", 'mcp_servers.agentchattr.default_tools_approval_mode="approve"',
     ]
+    link = CodexLink(argv, cwd, env, reporter, me["name"], inject=inject, mcp_flags=mcp_flags)
+    if not link.connect():
+        stop.set()
+        log("cannot launch a wake-capable Codex session")
+        return 1
     log(f"starting Codex as @{me['name']} in {cwd}")
-    tui = subprocess.Popen([*argv, *mcp_flags, *extra], cwd=str(cwd), env=env)
-    if link.rpc:
+    try:
+        tui = subprocess.Popen([*argv, "--remote", link.remote, *extra], cwd=str(cwd), env=env)
         threading.Thread(target=link.watch, args=(lambda: tui.poll() is None, stop), daemon=True).start()
 
-    builder = PromptBuilder(api, me["name"])
-    threading.Thread(target=poll_triggers,
-                     args=(api, lambda batch: link.deliver(builder.build(batch)), stop),
-                     daemon=True).start()
-    try:
+        builder = PromptBuilder(api, me["name"])
+        threading.Thread(target=poll_triggers,
+                         args=(api, lambda batch: link.deliver(builder.build(batch)), stop),
+                         daemon=True).start()
         return tui.wait()
     finally:
         stop.set()
-        if link.rpc:
-            link.rpc.close()
+        link.close()
 
 
 # ---------------------------------------------------------------------------

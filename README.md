@@ -830,7 +830,7 @@ Python package dependencies (`fastapi`, `uvicorn`, `mcp`) are listed in `require
 
 ## Platform notes
 
-- **LAN mode** runs the same on Windows, macOS and Linux. Claude is woken through its channel interface and Codex through `codex queue`, so nothing types into the terminal. The one exception is Codex on Windows without the app-server daemon, which falls back to console injection.
+- **LAN mode**: Claude is woken through its channel interface. Codex uses a client-owned local app server: the TUI, session watcher, and `codex queue --resume --remote unix://PATH` share its private socket. Per-client MCP credentials are supplied to that server in memory; existing Codex config files and the shared daemon are left untouched. Codex 0.166 does not forward the MCP `-c` overrides from a remote TUI, so pointing only the TUI at the shared daemon is insufficient. If the private server cannot start, the client exits instead of registering a session that cannot receive mentions. Windows retains console injection as a fallback while waiting for its thread to link.
 - **Windows (single-machine)**: `wrapper_windows.py` injects keystrokes into the agent's console via Win32 `WriteConsoleInput`. The agent runs as a direct subprocess.
 - **Mac/Linux (single-machine)**: `wrapper_unix.py` runs the agent inside a `tmux` session and delivers each prompt as a single bracketed paste (`tmux paste-buffer -p`), so a CLI that supports bracketed paste reassembles a long prompt even when the pty splits it across reads. Detach with `Ctrl+B, D` to leave the agent running in the background; reattach with `tmux attach -t agentchattr-claude`.
 

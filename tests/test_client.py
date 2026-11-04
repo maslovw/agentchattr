@@ -4,9 +4,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -38,6 +39,70 @@ class WakeBridgeTests(unittest.TestCase):
 
 
 class CodexLaunchTests(unittest.TestCase):
+    def test_private_server_watcher_and_queue_share_one_socket(self):
+        flags = ["-c", 'mcp_servers.agentchattr.url="http://chat:8200/mcp"']
+        reporter = MagicMock()
+        server = MagicMock()
+        server.poll.return_value = None
+
+        def start(args, **kwargs):
+            # Stand in for the external server binding its Unix socket.
+            Path(args[args.index("--listen") + 1].removeprefix("unix://")).touch()
+            return server
+
+        link = client.CodexLink(["codex"], ROOT, {}, reporter, "test", mcp_flags=flags)
+        with (patch.object(client.subprocess, "Popen", side_effect=start) as launch,
+              patch.object(client, "CodexRpc") as rpc,
+              patch.object(client.subprocess, "run") as queue_run):
+            rpc.return_value.loaded_threads.return_value = []
+            queue_run.return_value.returncode = 0
+            try:
+                self.assertTrue(link.connect())
+                socket_path = rpc.call_args.kwargs["socket_path"]
+                self.assertEqual(link.remote, "unix://" + socket_path)
+                self.assertEqual(launch.call_args.args[0],
+                                 ["codex", "app-server", *flags, "--listen", link.remote])
+                self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.DEVNULL)
+                link.thread_id = "our-thread"
+                link._linked.set()
+                link.deliver("wake")
+                self.assertEqual(queue_run.call_args.args[0], [
+                    "codex", "queue", "--thread", "our-thread", "--message", "wake",
+                    "--resume", "--remote", link.remote])
+            finally:
+                link.close()
+            self.assertFalse(Path(socket_path).parent.exists())
+            server.terminate.assert_called_once()
+
+    def test_mcp_overrides_are_hosted_on_the_same_server_as_the_tui(self):
+        # Without --remote, CLI config overrides select an embedded server,
+        # invisible to CodexLink even though chat registration succeeds.
+        api = client.Api("http://chat-server:8300", "test-token")
+        me = {"name": "codex-test", "mcp_url": "http://chat-server:8200/mcp"}
+        with (patch.object(client, "_codex_argv", return_value=["codex"]),
+              patch.object(client, "ActivityReporter"),
+              patch.object(client, "CodexLink") as link,
+              patch.object(client.threading, "Thread"),
+              patch.object(client.subprocess, "Popen") as popen):
+            link.return_value.connect.return_value = True
+            link.return_value.remote = "unix:///tmp/client-only.sock"
+            popen.return_value.wait.return_value = 0
+            self.assertEqual(client.run_codex(api, me, ROOT, ["--model", "chosen-model"]), 0)
+        args = popen.call_args.args[0]
+        self.assertIn("--remote", args)
+        self.assertEqual(args[args.index("--remote") + 1], "unix:///tmp/client-only.sock")
+        flags = link.call_args.kwargs["mcp_flags"]
+        overrides = [flags[i + 1] for i, arg in enumerate(flags) if arg == "-c"]
+        config = tomllib.loads("\n".join(overrides))
+        self.assertEqual(config["mcp_servers"]["agentchattr"], {
+            "url": "http://chat-server:8200/mcp",
+            "http_headers": {"Authorization": "Bearer test-token"},
+            "default_tools_approval_mode": "approve",
+        })
+        self.assertEqual(args[-2:], ["--model", "chosen-model"])
+        self.assertNotIn("test-token", " ".join(args))
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
+
     def test_cmd_shim_is_bypassed_through_node_when_possible(self):
         with tempfile.TemporaryDirectory() as tmp:
             shim = Path(tmp) / "codex.cmd"

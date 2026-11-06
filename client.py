@@ -215,6 +215,12 @@ _BRIDGE_INSTRUCTIONS = (
 )
 
 
+def _identity(name: str) -> str:
+    # Token names are [a-z0-9-], so this text is safe on a command line and in a TOML string.
+    return (f"Your name in the agentchattr chat is {name}. Messages that @mention {name} are "
+            f"addressed to you, and your chat_send posts appear as {name}.")
+
+
 def run_wake_bridge():
     """Stdio MCP server started by Claude Code. Do not print to stdout."""
     server = os.environ.get("AGENTCHATTR_SERVER", "")
@@ -273,7 +279,9 @@ def run_wake_bridge():
                 "protocolVersion": version,
                 "capabilities": {"experimental": {"claude/channel": {}}},
                 "serverInfo": {"name": WAKE_SERVER, "version": "1.0"},
-                "instructions": _BRIDGE_INSTRUCTIONS,
+                "instructions": " ".join(filter(None, [
+                    _BRIDGE_INSTRUCTIONS,
+                    _identity(os.environ["AGENTCHATTR_NAME"]) if os.environ.get("AGENTCHATTR_NAME") else ""])),
             }})
         elif method == "notifications/initialized":
             if not started:
@@ -323,7 +331,7 @@ def run_claude(api: Api, me: dict, cwd: Path, extra: list[str]) -> int:
     _write_state(str(state_file), "idle")
 
     client_env = {"AGENTCHATTR_SERVER": api.server, "AGENTCHATTR_TOKEN": api.token,
-                  "AGENTCHATTR_STATE": str(state_file)}
+                  "AGENTCHATTR_STATE": str(state_file), "AGENTCHATTR_NAME": me["name"]}
     mcp_config = {"mcpServers": {
         "agentchattr": {"type": "http", "url": me["mcp_url"],
                         "headers": {"Authorization": f"Bearer {api.token}"}},
@@ -634,6 +642,7 @@ def run_codex(api: Api, me: dict, cwd: Path, extra: list[str]) -> int:
         "-c", f'mcp_servers.agentchattr.url={json.dumps(me["mcp_url"])}',
         "-c", f'mcp_servers.agentchattr.http_headers={{Authorization={json.dumps("Bearer " + api.token)}}}',
         "-c", 'mcp_servers.agentchattr.default_tools_approval_mode="approve"',
+        "-c", f'developer_instructions={json.dumps(_identity(me["name"]))}',
     ]
     link = CodexLink(argv, cwd, env, reporter, me["name"], inject=inject, mcp_flags=mcp_flags)
     if not link.connect():

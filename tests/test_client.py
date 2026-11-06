@@ -15,8 +15,9 @@ import client
 
 
 class WakeBridgeTests(unittest.TestCase):
-    def talk(self, *messages):
-        env = {**os.environ, "AGENTCHATTR_SERVER": "http://127.0.0.1:9", "AGENTCHATTR_TOKEN": "t"}
+    def talk(self, *messages, **extra_env):
+        env = {**os.environ, "AGENTCHATTR_SERVER": "http://127.0.0.1:9", "AGENTCHATTR_TOKEN": "t",
+               **extra_env}
         stdin = "".join(json.dumps(m) + "\n" for m in messages)
         out = subprocess.run([sys.executable, str(ROOT / "client.py"), "wake-bridge"], input=stdin,
                              capture_output=True, text=True, env=env, timeout=20).stdout
@@ -30,6 +31,11 @@ class WakeBridgeTests(unittest.TestCase):
         self.assertEqual(reply["result"]["capabilities"], {"experimental": {"claude/channel": {}}})
         init["params"]["protocolVersion"] = "2025-03-26"
         self.assertEqual(self.talk(init)[0]["result"]["protocolVersion"], "2025-03-26")
+
+    def test_instructions_tell_the_agent_its_chat_name(self):
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        [reply] = self.talk(init, AGENTCHATTR_NAME="claude-pc1")
+        self.assertIn("Your name in the agentchattr chat is claude-pc1.", reply["result"]["instructions"])
 
     def test_answers_ping_and_rejects_unknown_requests(self):
         replies = self.talk({"jsonrpc": "2.0", "id": 1, "method": "ping"},
